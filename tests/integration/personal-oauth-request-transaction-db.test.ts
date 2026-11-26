@@ -692,4 +692,127 @@ dbSuite('personal OAuth refresh inside a request transaction (replica mode)', ()
     await expect(task).resolves.toBeUndefined();
     expect(await revision()).toBe(before + 1);
   });
+
+  test('a commit whose lock cannot be taken again returns, and the lock is lost', async () => {
+    const scope = JSON.stringify(['oauth', 'gitlab', 'alice']);
+    const revision = async () =>
+      Number(
+        (await mockSource.query('SELECT version FROM mcphub_revision WHERE id = 1'))[0].version,
+      );
+    const before = await revision();
+    // Another replica waits for the lock, then keeps it longer than the acquisition timeout.
+    const otherReplica = mockSource.createQueryRunner();
+    await otherReplica.connect();
+    let otherHolds: Promise<unknown> | undefined;
+    try {
+      await withReplicaLock(scope, async () => {
+        await otherReplica.startTransaction();
+        otherHolds = otherReplica.query('SELECT pg_advisory_xact_lock(209, hashtext($1))', [scope]);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        // The write is committed: its caller goes on, although the lock is not taken again.
+        await expect(
+          withLockConnection(
+            scope,
+            () => getAppDataSource().query('UPDATE mcphub_revision SET version = version + 1'),
+            { commit: true },
+          ),
+        ).resolves.toBeDefined();
+        expect(await revision()).toBe(before + 1);
+        await otherHolds;
+        // What needs the lock now fails instead of running unprotected.
+        await expect(withLockConnection(scope, async () => 'read')).rejects.toThrow(
+          'Replica lock lost',
+        );
+        await expect(withReplicaLock(scope, async () => 'nested')).rejects.toThrow(
+          'Replica lock lost',
+        );
+      });
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Replica lock lost after committing credential work'),
+        expect.anything(),
+      );
+    } finally {
+      await otherHolds?.catch(() => undefined);
+      if (otherReplica.isTransactionActive) await otherReplica.rollbackTransaction();
+      await otherReplica.release();
+    }
+    // Once released, the lock is taken again at once.
+    await expect(withReplicaLock(scope, async () => 'free')).resolves.toBe('free');
+  }, 30_000);
+
+  test('concurrent nested credential work keeps its savepoints apart', async () => {
+    const scope = JSON.stringify(['oauth', 'gitlab', 'alice']);
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const revision = async () =>
+      Number(
+        (await mockSource.query('SELECT version FROM mcphub_revision WHERE id = 1'))[0].version,
+      );
+    const before = await revision();
+    const bump = (by: number) =>
+      getAppDataSource().query('UPDATE mcphub_revision SET version = version + $1', [by]);
+    await withReplicaLock(scope, async () => {
+      await withLockConnection(
+        scope,
+        async () => {
+          const results = await Promise.allSettled([
+            withLockConnection(scope, async () => {
+              await bump(1);
+              await sleep(100);
+            }),
+            withLockConnection(scope, async () => {
+              await sleep(50);
+              await bump(10);
+              throw new Error('nested failure');
+            }),
+          ]);
+          expect(results.map((result) => result.status)).toEqual(['fulfilled', 'rejected']);
+        },
+        { commit: true },
+      );
+    });
+    // Only the failed piece is rolled back.
+    expect(await revision()).toBe(before + 1);
+  });
+
+  test('credential work waits for row locks for a bounded time', async () => {
+    const scope = JSON.stringify(['oauth', 'gitlab', 'alice']);
+    await withReplicaLock(scope, async () => {
+      const [{ lock_timeout: timeout }] = await withLockConnection(scope, () =>
+        getAppDataSource().query('SHOW lock_timeout'),
+      );
+      expect(timeout).toBe('1min');
+    });
+  });
+
+  test('a lock connection that cannot be rolled back is discarded with its lock', async () => {
+    const scope = JSON.stringify(['oauth', 'gitlab', 'alice']);
+    const createQueryRunner = mockSource.createQueryRunner.bind(mockSource);
+    jest.spyOn(mockSource, 'createQueryRunner').mockImplementationOnce((...args) => {
+      const runner = createQueryRunner(...args);
+      const query = runner.query.bind(runner);
+      runner.query = (async (sql: string, ...rest: unknown[]) => {
+        if (sql === 'ROLLBACK') throw new Error('rollback failed');
+        return (query as (...all: unknown[]) => Promise<unknown>)(sql, ...rest);
+      }) as typeof runner.query;
+      return runner;
+    });
+    // The action's error is reported, not the rollback's.
+    await expect(
+      withReplicaLock(scope, async () => {
+        throw new Error('action failed');
+      }),
+    ).rejects.toThrow('action failed');
+    // The session of the discarded connection ended with its advisory lock.
+    const otherReplica = mockSource.createQueryRunner();
+    await otherReplica.connect();
+    try {
+      await otherReplica.startTransaction();
+      await otherReplica.query("SET LOCAL lock_timeout = '2s'");
+      await otherReplica.query('SELECT pg_advisory_xact_lock(209, hashtext($1))', [scope]);
+      await otherReplica.commitTransaction();
+    } finally {
+      if (otherReplica.isTransactionActive) await otherReplica.rollbackTransaction();
+      await otherReplica.release();
+    }
+  });
 });
